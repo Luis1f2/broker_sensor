@@ -1,155 +1,96 @@
 const amqp = require('amqplib');
-const mysql = require('mysql2/promise');
 const axios = require('axios');
+require('dotenv').config(); // Cargar las variables del archivo .env
 
 // Configuración desde variables de entorno
 const rabbitMQUrl = process.env.RABBITMQ_URL || 'amqp://Luis:Luis@54.237.63.42:5672';
 const rfidQueueName = process.env.RFID_QUEUE || 'sensor_data'; // Exclusivo para RFID
 const sensorsQueueName = process.env.SENSORS_QUEUE || 'sensores_data'; // Nueva cola para otros sensores
 const notificationButtonQueueName = process.env.NOTIFICATION_BUTTON_QUEUE || 'boton_notificaciones';
-const emergencyButtonQueueName = process.env.EMERGENCY_BUTTON_QUEUE || 'boton_alert';
-const alertButtonQueueName = process.env.ALERT_BUTTON_QUEUE || 'boton_alerta'; // Nueva cola para el botón de alerta
-const dbConfig = {
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASS,
-  database: process.env.DB_NAME,
-};
+const alertButtonQueueName = process.env.ALERT_BUTTON_QUEUE || 'boton_alerta'; // Cola para el botón de alerta
 
 const MAX_RETRY_COUNT = 5;
 
-// Crear un pool de conexiones MySQL
-const dbPool = mysql.createPool(dbConfig);
+// Crear un cliente Axios con timeout
+const axiosInstance = axios.create({
+  timeout: 5000, // Tiempo máximo de espera de 5 segundos
+});
 
-// Función para insertar en la base de datos
-async function insertIntoDatabase(sensorId, value, message) {
-  try {
-    const connection = await dbPool.getConnection();
-    const query = `
-      INSERT INTO SensorActivity (sensor_id, value, message) 
-      VALUES (?, ?, ?)
-    `;
-    await connection.query(query, [sensorId, value, message]);
-    console.log(`Datos insertados: Sensor ID = ${sensorId}, Valor = ${value}, Mensaje = "${message}"`);
-    connection.release();
-  } catch (error) {
-    console.error('Error al insertar en la base de datos:', error.message);
-  }
-}
-
-// Función para manejar mensajes de la cola sensores_data
-async function handleSensorsDataMessage(channel, message) {
+// Función para manejar mensajes y enviar datos a la API
+async function handleMessageToAPI(channel, message, apiUrl, queueName) {
   if (!message) return;
 
-  try {
-    // Parsear el contenido del mensaje
-    const sensorData = JSON.parse(message.content.toString());
-    const { sensor_id, value, message: sensorMessage } = sensorData;
+  let content = JSON.parse(message.content.toString());
+  console.log(`Mensaje recibido en la cola "${queueName}":`, content);
 
-    console.log(`Mensaje recibido: Sensor ID = ${sensor_id}, Valor = ${value}, Mensaje = "${sensorMessage}"`);
-
-    // Guardar en la base de datos
-    await insertIntoDatabase(sensor_id, value, sensorMessage);
-
-    // Confirmar el procesamiento del mensaje
-    channel.ack(message);
-    console.log('Mensaje procesado y guardado en la base de datos');
-  } catch (error) {
-    console.error('Error procesando el mensaje de sensores_data:', error.message);
-
-    const retryCount = (message.properties && message.properties.headers && message.properties.headers['x-retry']) || 0;
-
-    if (retryCount < MAX_RETRY_COUNT) {
-      const newRetryCount = retryCount + 1;
-      console.warn(`Reintentando mensaje (${newRetryCount} de ${MAX_RETRY_COUNT})`);
-      channel.sendToQueue(sensorsQueueName, Buffer.from(message.content), {
-        headers: { 'x-retry': newRetryCount },
-        persistent: true,
-      });
-    } else {
-      console.warn(`Mensaje descartado tras ${retryCount} reintentos fallidos: ${message.content.toString()}`);
-      channel.sendToQueue(`${sensorsQueueName}_dlq`, Buffer.from(message.content), {
-        persistent: true,
-      });
-    }
-
-    channel.ack(message);
-  }
-}
-
-// Función para manejar mensajes del botón de notificaciones
-async function handleNotificationButtonMessage(channel, message) {
-  if (!message) return;
-
-  const buttonMessage = message.content.toString();
-  console.log(`Mensaje recibido del botón de notificaciones: ${buttonMessage}`);
-
-  const retryCount = (message.properties && message.properties.headers && message.properties.headers['x-retry']) || 0;
+  const retryCount = (message.properties.headers?.['x-retry'] || 0);
 
   try {
-    const response = await axios.post('http://localhost:8083/notification/button-pressed', 
-      { event: "botón notificaciones presionado" },
-      { headers: { 'Content-Type': 'application/json' } }
-    );
+    // Si es la cola "boton_alerta", no transformar el mensaje
+    if (queueName === 'boton_alerta') {
+      console.log(`Enviando mensaje sin transformación desde la cola "${queueName}":`, content);
 
-    console.log('Confirmación enviada al backend:', response.data);
-    channel.ack(message); 
-  } catch (error) {
-    console.error('Error enviando mensaje del botón de notificaciones al backend:', error.message);
+      // Enviar datos a la API tal cual
+      const response = await axiosInstance.post(apiUrl, content, {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
 
-    if (retryCount < MAX_RETRY_COUNT) {
-      const newRetryCount = retryCount + 1;
-      console.warn(`Reintentando mensaje del botón de notificaciones (${newRetryCount} de ${MAX_RETRY_COUNT})`);
-      channel.sendToQueue(notificationButtonQueueName, Buffer.from(buttonMessage), {
-        headers: { 'x-retry': newRetryCount },
-        persistent: true,
-      });
-    } else {
-      console.warn(`Mensaje descartado tras ${retryCount} reintentos fallidos: ${buttonMessage}`);
-      channel.sendToQueue(`${notificationButtonQueueName}_dlq`, Buffer.from(buttonMessage), {
-        persistent: true,
-      });
+      console.log(`Respuesta de la API para la cola "${queueName}":`, response.data);
+
+      // Confirmar el mensaje si se procesó correctamente
       channel.ack(message);
+      return; // Terminar aquí para evitar la transformación
     }
-  }
-}
 
-// Función para manejar mensajes del botón de alerta
-async function handleAlertButtonMessage(channel, message) {
-  if (!message) return;
+    // Lógica de transformación para otras colas
+    if (!content.id_usuario) {
+      content.id_usuario = 0; // Usuario predeterminado
+    }
+    if (!content.mensaje) {
+      content.mensaje = `Mensaje desde ${queueName}`;
+    }
+    if (!content.fecha_alerta) {
+      content.fecha_alerta = new Date().toISOString(); // Fecha actual
+    }
+    console.log(`Mensaje transformado para la cola "${queueName}":`, content);
 
-  const alertMessage = message.content.toString();
-  console.log(`Mensaje recibido del botón de alerta: ${alertMessage}`);
+    // Enviar datos transformados a la API
+    const response = await axiosInstance.post(apiUrl, content, {
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
 
-  const retryCount = (message.properties && message.properties.headers && message.properties.headers['x-retry']) || 0;
+    console.log(`Respuesta de la API para la cola "${queueName}":`, response.data);
 
-  try {
-    const response = await axios.post('http://localhost:8083/alerts/button-pressed', 
-      { event: "botón alerta presionado" },
-      { headers: { 'Content-Type': 'application/json' } }
-    );
-
-    console.log('Alerta enviada al backend:', response.data);
-    channel.ack(message); 
+    // Confirmar el mensaje si se procesó correctamente
+    channel.ack(message);
   } catch (error) {
-    console.error('Error enviando mensaje del botón de alerta al backend:', error.message);
+    console.error(`Error enviando datos a la API desde la cola "${queueName}":`, {
+      message: error.message,
+      status: error.response?.status,
+      data: error.response?.data,
+    });
 
+    // Manejo de reintentos
     if (retryCount < MAX_RETRY_COUNT) {
       const newRetryCount = retryCount + 1;
-      console.warn(`Reintentando mensaje del botón de alerta (${newRetryCount} de ${MAX_RETRY_COUNT})`);
-      channel.sendToQueue(alertButtonQueueName, Buffer.from(alertMessage), {
+      console.warn(`Reintentando mensaje (${newRetryCount} de ${MAX_RETRY_COUNT}) en la cola "${queueName}"`);
+      channel.sendToQueue(queueName, Buffer.from(message.content), {
         headers: { 'x-retry': newRetryCount },
         persistent: true,
       });
     } else {
-      console.warn(`Mensaje descartado tras ${retryCount} reintentos fallidos: ${alertMessage}`);
-      channel.sendToQueue(`${alertButtonQueueName}_dlq`, Buffer.from(alertMessage), {
-        persistent: true,
-      });
-      channel.ack(message);
+      console.warn(`Mensaje descartado tras ${retryCount} intentos fallidos en la cola "${queueName}"`);
+      channel.sendToQueue(`${queueName}_dlq`, Buffer.from(message.content), { persistent: true });
     }
+
+    channel.ack(message); // Confirmar el mensaje incluso si falla para evitar bloqueo
   }
 }
+
 
 // Consumir mensajes de RabbitMQ
 async function connectToRabbitMQ() {
@@ -158,43 +99,55 @@ async function connectToRabbitMQ() {
     const connection = await amqp.connect(rabbitMQUrl);
     const channel = await connection.createChannel();
 
-    console.log('Configurando colas...');
-    await channel.assertQueue(rfidQueueName, { durable: true });
-    await channel.assertQueue(sensorsQueueName, { durable: true });
-    await channel.assertQueue(notificationButtonQueueName, { durable: true });
-    await channel.assertQueue(emergencyButtonQueueName, { durable: true });
-    await channel.assertQueue(alertButtonQueueName, { durable: true });
-    await channel.assertQueue(`${rfidQueueName}_dlq`, { durable: true });
-    await channel.assertQueue(`${sensorsQueueName}_dlq`, { durable: true });
+    console.log('Conexión a RabbitMQ establecida.');
 
-    channel.prefetch(10);
+    channel.on('close', () => {
+      console.error('Conexión cerrada. Intentando reconectar...');
+      setTimeout(connectToRabbitMQ, 5000);
+    });
 
-    // Consumir mensajes de las colas
-    channel.consume(notificationButtonQueueName, (message) => {
-      console.log(`Mensaje recibido en la cola "${notificationButtonQueueName}"`);
-      handleNotificationButtonMessage(channel, message);
-    }, { noAck: false });
+    channel.on('error', (err) => {
+      console.error('Error en la conexión de RabbitMQ:', err.message);
+      setTimeout(connectToRabbitMQ, 5000);
+    });
 
-    channel.consume(alertButtonQueueName, (message) => {
-      console.log(`Mensaje recibido en la cola "${alertButtonQueueName}"`);
-      handleAlertButtonMessage(channel, message);
-    }, { noAck: false });
+    // Configuración de colas
+    await configureQueues(channel);
 
-    channel.consume(rfidQueueName, (message) => {
-      console.log(`Mensaje recibido en la cola "${rfidQueueName}"`);
-      handleSensorDataMessage(channel, message); // Supongo que ya tienes esto funcionando para RFID
-    }, { noAck: false });
-
-    channel.consume(sensorsQueueName, (message) => {
-      console.log(`Mensaje recibido en la cola "${sensorsQueueName}"`);
-      handleSensorsDataMessage(channel, message);
-    }, { noAck: false });
-
+    // Consumir mensajes
+    startConsumers(channel);
   } catch (error) {
     console.error('Error al conectar con RabbitMQ:', error.message);
     setTimeout(connectToRabbitMQ, 5000);
   }
 }
 
-// Iniciar conexión
+function configureQueues(channel) {
+  return Promise.all([
+    channel.assertQueue(rfidQueueName, { durable: true }),
+    channel.assertQueue(sensorsQueueName, { durable: true }),
+    channel.assertQueue(notificationButtonQueueName, { durable: true }),
+    channel.assertQueue(alertButtonQueueName, { durable: true }),
+    channel.assertQueue(`${rfidQueueName}_dlq`, { durable: true }),
+    channel.assertQueue(`${sensorsQueueName}_dlq`, { durable: true }),
+  ]);
+}
+
+function startConsumers(channel) {
+  channel.prefetch(10);
+
+  // Consumir mensajes para las colas que envían a la API
+  channel.consume(notificationButtonQueueName, (message) => {
+    handleMessageToAPI(channel, message, 'http://localhost:8083/notification/button-pressed', notificationButtonQueueName);
+  }, { noAck: false });
+
+  channel.consume(alertButtonQueueName, (message) => {
+    handleMessageToAPI(channel, message, 'http://localhost:3000/alerts', alertButtonQueueName);
+  }, { noAck: false });
+
+  channel.consume(rfidQueueName, (message) => {
+    handleMessageToAPI(channel, message, 'http://localhost:8083/rfid/data', rfidQueueName);
+  }, { noAck: false });
+}
+
 connectToRabbitMQ();
