@@ -138,15 +138,15 @@ function startConsumers(channel) {
 
   // Consumir mensajes para las colas que envían a la API
   channel.consume(notificationButtonQueueName, (message) => {
-    handleMessageToAPI(channel, message, 'http://localhost:8083/notification/button-pressed', notificationButtonQueueName);
+    handleMessageToAPI(channel, message, 'https://back-pillcare.zapto.org/button-pressed', notificationButtonQueueName);
   }, { noAck: false });
 
   channel.consume(alertButtonQueueName, (message) => {
-    handleMessageToAPI(channel, message, 'http://localhost:3000/alerts', alertButtonQueueName);
+    handleMessageToAPI(channel, message, 'http://54.163.130.107:3000/alerts', alertButtonQueueName);
   }, { noAck: false });
 
   channel.consume(rfidQueueName, (message) => {
-    handleMessageToAPI(channel, message, 'http://localhost:8083/rfid/data', rfidQueueName);
+    handleMessageToAPI(channel, message, 'https://back-pillcare.zapto.org/rfid/data', rfidQueueName);
   }, { noAck: false });
 }
 
