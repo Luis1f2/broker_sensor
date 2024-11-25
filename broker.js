@@ -4,7 +4,8 @@ const axios = require('axios');
 
 // Configuración desde variables de entorno
 const rabbitMQUrl = process.env.RABBITMQ_URL || 'amqp://Luis:Luis@54.237.63.42:5672';
-const rfidQueueName = process.env.RFID_QUEUE || 'sensor_data';
+const rfidQueueName = process.env.RFID_QUEUE || 'sensor_data'; // Exclusivo para RFID
+const sensorsQueueName = process.env.SENSORS_QUEUE || 'sensores_data'; // Nueva cola para otros sensores
 const notificationButtonQueueName = process.env.NOTIFICATION_BUTTON_QUEUE || 'boton_notificaciones';
 const emergencyButtonQueueName = process.env.EMERGENCY_BUTTON_QUEUE || 'boton_alert';
 const alertButtonQueueName = process.env.ALERT_BUTTON_QUEUE || 'boton_alerta'; // Nueva cola para el botón de alerta
@@ -33,6 +34,46 @@ async function insertIntoDatabase(sensorId, value, message) {
     connection.release();
   } catch (error) {
     console.error('Error al insertar en la base de datos:', error.message);
+  }
+}
+
+// Función para manejar mensajes de la cola sensores_data
+async function handleSensorsDataMessage(channel, message) {
+  if (!message) return;
+
+  try {
+    // Parsear el contenido del mensaje
+    const sensorData = JSON.parse(message.content.toString());
+    const { sensor_id, value, message: sensorMessage } = sensorData;
+
+    console.log(`Mensaje recibido: Sensor ID = ${sensor_id}, Valor = ${value}, Mensaje = "${sensorMessage}"`);
+
+    // Guardar en la base de datos
+    await insertIntoDatabase(sensor_id, value, sensorMessage);
+
+    // Confirmar el procesamiento del mensaje
+    channel.ack(message);
+    console.log('Mensaje procesado y guardado en la base de datos');
+  } catch (error) {
+    console.error('Error procesando el mensaje de sensores_data:', error.message);
+
+    const retryCount = (message.properties && message.properties.headers && message.properties.headers['x-retry']) || 0;
+
+    if (retryCount < MAX_RETRY_COUNT) {
+      const newRetryCount = retryCount + 1;
+      console.warn(`Reintentando mensaje (${newRetryCount} de ${MAX_RETRY_COUNT})`);
+      channel.sendToQueue(sensorsQueueName, Buffer.from(message.content), {
+        headers: { 'x-retry': newRetryCount },
+        persistent: true,
+      });
+    } else {
+      console.warn(`Mensaje descartado tras ${retryCount} reintentos fallidos: ${message.content.toString()}`);
+      channel.sendToQueue(`${sensorsQueueName}_dlq`, Buffer.from(message.content), {
+        persistent: true,
+      });
+    }
+
+    channel.ack(message);
   }
 }
 
@@ -110,46 +151,6 @@ async function handleAlertButtonMessage(channel, message) {
   }
 }
 
-// Función para manejar mensajes de la cola sensor_data
-async function handleSensorDataMessage(channel, message) {
-  if (!message) return;
-
-  try {
-    // Parsear el contenido del mensaje
-    const sensorData = JSON.parse(message.content.toString());
-    const { sensor_id, value, message: sensorMessage } = sensorData;
-
-    console.log(`Mensaje recibido: Sensor ID = ${sensor_id}, Valor = ${value}, Mensaje = "${sensorMessage}"`);
-
-    // Guardar en la base de datos
-    await insertIntoDatabase(sensor_id, value, sensorMessage);
-
-    // Confirmar el procesamiento del mensaje
-    channel.ack(message);
-    console.log('Mensaje procesado y guardado en la base de datos');
-  } catch (error) {
-    console.error('Error procesando el mensaje de sensor_data:', error.message);
-
-    const retryCount = (message.properties && message.properties.headers && message.properties.headers['x-retry']) || 0;
-
-    if (retryCount < MAX_RETRY_COUNT) {
-      const newRetryCount = retryCount + 1;
-      console.warn(`Reintentando mensaje (${newRetryCount} de ${MAX_RETRY_COUNT})`);
-      channel.sendToQueue(rfidQueueName, Buffer.from(message.content), {
-        headers: { 'x-retry': newRetryCount },
-        persistent: true,
-      });
-    } else {
-      console.warn(`Mensaje descartado tras ${retryCount} reintentos fallidos: ${message.content.toString()}`);
-      channel.sendToQueue(`${rfidQueueName}_dlq`, Buffer.from(message.content), {
-        persistent: true,
-      });
-    }
-
-    channel.ack(message);
-  }
-}
-
 // Consumir mensajes de RabbitMQ
 async function connectToRabbitMQ() {
   try {
@@ -159,10 +160,12 @@ async function connectToRabbitMQ() {
 
     console.log('Configurando colas...');
     await channel.assertQueue(rfidQueueName, { durable: true });
+    await channel.assertQueue(sensorsQueueName, { durable: true });
     await channel.assertQueue(notificationButtonQueueName, { durable: true });
     await channel.assertQueue(emergencyButtonQueueName, { durable: true });
     await channel.assertQueue(alertButtonQueueName, { durable: true });
     await channel.assertQueue(`${rfidQueueName}_dlq`, { durable: true });
+    await channel.assertQueue(`${sensorsQueueName}_dlq`, { durable: true });
 
     channel.prefetch(10);
 
@@ -179,7 +182,12 @@ async function connectToRabbitMQ() {
 
     channel.consume(rfidQueueName, (message) => {
       console.log(`Mensaje recibido en la cola "${rfidQueueName}"`);
-      handleSensorDataMessage(channel, message);
+      handleSensorDataMessage(channel, message); // Supongo que ya tienes esto funcionando para RFID
+    }, { noAck: false });
+
+    channel.consume(sensorsQueueName, (message) => {
+      console.log(`Mensaje recibido en la cola "${sensorsQueueName}"`);
+      handleSensorsDataMessage(channel, message);
     }, { noAck: false });
 
   } catch (error) {
