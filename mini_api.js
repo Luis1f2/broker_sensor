@@ -1,8 +1,16 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-
+const cors = require('cors'); // 
 const app = express();
 const PORT = 3000; // Cambia el puerto según necesites
+const corsOptions = {
+  origin: 'http://54.163.130.107', // Reemplaza con el dominio permitido
+  methods: ['GET', 'POST'], // Métodos permitidos
+  allowedHeaders: ['Content-Type'] // Cabeceras permitidas
+};
+app.use(cors(corsOptions));
+
+
 
 // Almacenar temporalmente las alertas en memoria
 let alerts = [];
