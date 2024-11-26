@@ -5,7 +5,7 @@ const app = express();
 const PORT = 3000; // Cambia el puerto según necesites
 
 const corsOptions = {
-  origin: ['http://54.163.130.107:3000', 'http://127.0.0.1:5500', 'https://pillcare.zapto.org/'], // Reemplaza con el dominio permitido
+  origin: ['http://54.163.130.107:3000', 'http://127.0.0.1:5500', 'https://pillcare.zapto.org/','http://localhost:5173/'], // Reemplaza con el dominio permitido
   methods: ['GET', 'POST'], // Métodos permitidos
   allowedHeaders: ['Content-Type'] // Cabeceras permitidas
 };
